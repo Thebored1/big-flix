@@ -1,0 +1,102 @@
+# Docker GPG Key Fix Walkthrough
+
+I have fixed the `NO_PUBKEY` error that was occurring during the Docker installation process in WSL.
+
+## Changes
+
+### [install_custom_erpnext_docker.ps1](file:///c:/Projects/erpdock/install_custom_erpnext_docker.ps1)
+
+I added a cleanup step to remove any existing Docker repository configurations before starting the installation, and a `chmod` command to ensure the Docker GPG key is readable.
+
+```powershell
+# Cleanup potential dirty state from previous runs
+rm -f /etc/apt/sources.list.d/docker.list
+rm -f /etc/apt/keyrings/docker.gpg
+
+# ... later in the script ...
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+```
+
+I also renamed the default site from `frontend` to `erpnext.localhost` to avoid naming conflicts and ensure the site is correctly recognized.
+
+```powershell
+sed -i 's|--set-default frontend|--set-default erpnext.localhost|g' pwd.yml
+sed -i 's|FRAPPE_SITE_NAME_HEADER: frontend|FRAPPE_SITE_NAME_HEADER: erpnext.localhost|g' pwd.yml
+```
+
+Finally, I updated the script to automatically install the `payments` and `webshop` apps on the site, as they were previously only being built into the image but not installed.
+
+```powershell
+sed -i 's|--install-app erpnext|--install-app erpnext --install-app payments --install-app webshop|g' pwd.yml
+```
+
+I also fixed the [start_erpnext.ps1](file:///c:/Projects/erpdock/start_erpnext.ps1) script to explicitly use the `pwd.yml` configuration file, which prevents it from trying to use the default `compose.yaml` and failing.
+
+```powershell
+wsl -d $wslDistro -- bash -c "cd /opt/frappe_docker && docker compose -f pwd.yml up -d"
+```
+
+I also added the `erpnext_sync_app` to the installation list and included a `bench restart` command at the end of the script to ensure all changes are applied.
+
+```powershell
+@{ name = "erpnext_sync_app"; url = "https://github.com/Thebored1/erpnext_sync_app"; branch = "main" }
+# ...
+sed -i 's|--install-app erpnext|--install-app erpnext --install-app payments --install-app webshop --install-app erpnext_sync_app|g' pwd.yml
+# ...
+docker compose -f pwd.yml exec backend bench restart
+```
+
+I also added a time synchronization step to the beginning of the script to prevent `apt-get` errors caused by clock skew in WSL.
+
+```powershell
+echo '==> 0. Syncing Time...'
+hwclock -s || true
+```
+
+### Missing Apps Fix
+
+The apps were missing because the site already existed from a previous failed run. I updated the script to force the installation of apps even if the site exists (warning: this will overwrite the site).
+
+```powershell
+sed -i 's|--install-app erpnext|--force --install-app erpnext --install-app payments --install-app webshop --install-app sync_app|g' pwd.yml
+```
+
+I also manually installed `payments` and `sync_app` on your current site. `webshop` failed to install due to a conflict, so I recommend running the full install script again to get a clean state.
+
+### Docker Build Cache Fix
+
+I noticed that Docker was using cached layers for the build, which meant it wasn't picking up the new apps list. I added the `--no-cache` flag to the build command to force a fresh build every time.
+
+```powershell
+docker build \
+  --no-cache \
+  # ...
+```
+
+### Startup Script Improvements
+
+I updated [start_erpnext.ps1](file:///c:/Projects/erpdock/start_erpnext.ps1) to ensure reliability after system restarts:
+
+1. **Wait for database** - Ensures MariaDB is ready before proceeding
+2. **Wait for site creation** - Waits for the `create-site` container to finish installing all apps
+3. **Health check** - Verifies the site returns HTTP 200 before showing success
+
+```powershell
+# Wait for database
+wsl -d $wslDistro -- bash -c "for i in {1..30}; do docker exec frappe_docker-db-1 mysqladmin ping -h localhost -padmin >/dev/null 2>&1 && break || sleep 1; done"
+
+# Wait for site creation
+wsl -d $wslDistro -- bash -c "for i in {1..60}; do docker inspect frappe_docker-create-site-1 --format='{{.State.Status}}' | grep -q 'exited' && break || sleep 2; done"
+
+# Health check
+$healthCheck = wsl -d $wslDistro -- bash -c "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080"
+if ($healthCheck -ne "200") {
+    Write-Host "[WARNING] Site may not be fully ready (HTTP $healthCheck). Check logs if you see errors." -ForegroundColor Yellow
+}
+```
+
+## Verification
+
+Please run the [install_custom_erpnext_docker.ps1](file:///c:/Projects/erpdock/install_custom_erpnext_docker.ps1) script again as Administrator. The error should be resolved.
